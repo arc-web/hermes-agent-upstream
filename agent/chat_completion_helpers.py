@@ -9,6 +9,8 @@ forwarders. Symbols tests patch on ``run_agent`` (``cleanup_vm`` /
 
 from __future__ import annotations
 
+from cron.run_limits import bounded_run_for
+
 import contextlib
 import contextvars
 import json
@@ -766,6 +768,9 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     so callers can register it with their abort/close machinery; bedrock / MoA
     manage their own clients. Interrupt/abort/close semantics stay in callers.
     """
+    bounded = bounded_run_for(agent)
+    if bounded is not None:
+        bounded.check()
     if agent.api_mode == "codex_responses":
         return agent._run_codex_stream(api_kwargs, client=make_client("codex_stream_request"),
             on_first_delta=getattr(agent, "_codex_on_first_delta", None))
@@ -1020,6 +1025,9 @@ def direct_api_call(agent, api_kwargs: dict):
     aborts in-flight sockets via the registered hook, and a per-call ``timeout``
     equal to the stale budget is the backstop when the abort finds nothing (#85252).
     Both surface a retryable ``TimeoutError`` for the outer retry loop."""
+    bounded = bounded_run_for(agent)
+    if bounded is not None:
+        bounded.check()
     _check_stale_giveup(agent)
     agent._touch_activity("waiting for non-streaming API response")
     # Resolve the budget BEFORE the heartbeat starts: the resolver may raise
@@ -1296,6 +1304,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
     per-request client (interrupts close only that one); a stale-call detector
     kills the connection and raises so the main retry loop can back off / rotate
     credentials / fall back."""
+    bounded = bounded_run_for(agent)
+    if bounded is not None:
+        bounded.check()
     # Nested-pool contexts (cron, delegated children) wedge on a worker thread
     # (#62151): run inline. See should_use_direct_api_call.
     if should_use_direct_api_call(agent):
@@ -1541,6 +1552,9 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     every request regardless of transport (chat_completions / codex_responses /
     anthropic_messages). No-op for every other provider.
     """
+    bounded = bounded_run_for(agent)
+    if bounded is not None:
+        bounded.check()
     from agent.opencode_affinity import merge_session_affinity_headers
 
     kwargs = _build_api_kwargs_for_mode(agent, api_messages, tools_for_api)
@@ -4116,6 +4130,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     text token (tool-call turns suppress them) and returns a SimpleNamespace in
     the non-streaming response shape. codex_responses delegates to the already-
     streaming codex runner; cron turns and delegated children run inline."""
+    bounded = bounded_run_for(agent)
+    if bounded is not None:
+        bounded.check()
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
     if agent.api_mode == "codex_responses":

@@ -11,6 +11,8 @@ the delegation call and the summary result, never the child's intermediate
 tool calls or reasoning.
 """
 
+from cron.run_limits import bounded_run_for
+
 import logging
 import time
 import weakref
@@ -187,7 +189,8 @@ def _build_child_agent(
     # Role is depth-derived: a child may delegate iff the kill switch is on and
     # depth budget remains below max_spawn_depth. The `role` arg is ignored.
     child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
-    max_spawn = _get_max_spawn_depth()
+    bounded = bounded_run_for(parent_agent)
+    max_spawn = 1 if bounded is not None else _get_max_spawn_depth()
     effective_role = "orchestrator" if _get_orchestrator_enabled() and child_depth < max_spawn else "leaf"
 
     # One subagent_id shared by the progress callback, spawn_requested event and
@@ -200,6 +203,11 @@ def _build_child_agent(
     # as auxiliary.review.
     delegation_cfg = _load_config()
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
+    if bounded is not None:
+        bounded.check()
+        max_iterations = min(max_iterations, bounded.limits["child_max_iterations"])
+        child_toolsets = ["no_mcp"]  # bounded category reviews consume supplied evidence only
+        child_disabled_toolsets = list(set(child_disabled_toolsets or []) | {"delegation"})
     child_prompt = _build_child_system_prompt(
         goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
         max_spawn_depth=max_spawn, child_depth=child_depth,
@@ -229,6 +237,10 @@ def _build_child_agent(
         request_overrides = dict(override_request_overrides)
     else:
         request_overrides = {} if override_provider else dict(getattr(parent_agent, "request_overrides", {}) or {})
+    if bounded is not None:
+        rt["max_tokens"] = min(rt.get("max_tokens") or bounded.limits["child_max_output_tokens"], bounded.limits["child_max_output_tokens"])
+        for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+            request_overrides.pop(key, None)
     parent_sid = getattr(parent_agent, "session_id", None)
     child_session_db = _open_child_session_db(parent_agent)
     with delegated_child_context():
@@ -253,6 +265,13 @@ def _build_child_agent(
                 with _quiet(None):
                     from hermes_state_registry import release_or_close
                     release_or_close(child_session_db)
+            raise
+    if bounded is not None:
+        child._bounded_cron_run = bounded
+        try:
+            bounded.register_child(child)
+        except Exception:
+            child.close()
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     _apply_child_cache_ttl(child)
@@ -328,6 +347,7 @@ def _run_single_child(
     # Set when a timed-out Future still owns the child: closing it from this
     # thread before the worker settles races the conversation's finally path.
     _child_close_deferred = False
+    _bounded_child_success = False
     try:
         heartbeat.start()
         _safe_progress(child_progress_cb, "subagent.start", preview=goal)
@@ -348,6 +368,7 @@ def _run_single_child(
         run.append_sibling_write_reminder(entry)
         run.account_background_processes(entry)
         run.emit_complete(result, entry, duration)
+        _bounded_child_success = not result.get("error") and not result.get("failed") and not result.get("interrupted") and result.get("completed") is True and entry.get("status") not in {"error", "failed", "interrupted"}
         return run.attach_worktree(entry)
     except Exception as exc:
         # Close steer acceptance before any completion callback (see _merge_late_steer).
@@ -359,6 +380,9 @@ def _run_single_child(
             preview=str(exc), summary=str(exc), status="failed",
         )
     finally:
+        bounded = bounded_run_for(child)
+        if bounded is not None and not _child_close_deferred:
+            bounded.finish_child(child, successful=_bounded_child_success)
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
 
 
@@ -420,6 +444,8 @@ def _build_children(
 def _oneshot_spawn_budget(parent_agent: Any, requested: int) -> Optional[str]:
     """Charge *requested* children against the finite one-shot session's total (delegation.oneshot_max_children);
     the error text tells the model to do the work inline. Interactive and gateway sessions are never charged."""
+    if bounded_run_for(parent_agent) is not None:
+        return None  # trusted job-scoped total cap was charged by admit_children
     from agent.oneshot_footprint import is_single_query_session
     if not is_single_query_session():
         return None
@@ -470,13 +496,20 @@ def delegate_task(
     background = is_truthy_value(background, default=False) if background is not None else False
 
     depth = getattr(parent_agent, "_delegate_depth", 0)
-    max_spawn = _get_max_spawn_depth()
+    bounded = bounded_run_for(parent_agent)
+    max_spawn = 1 if bounded is not None else _get_max_spawn_depth()
     if depth >= max_spawn:
         return tool_error(
             f"Delegation depth limit reached (depth={depth}, max_spawn_depth={max_spawn}). Raise "
             f"delegation.max_spawn_depth in config.yaml if deeper nesting is required (no hard ceiling, but each level "
             f"multiplies API cost)."
         )
+
+    if bounded is not None:
+        try:
+            bounded.check()
+        except RuntimeError as exc:
+            return tool_error(str(exc))
 
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
@@ -498,6 +531,9 @@ def delegate_task(
         # spawn loudly (#80450).
         return tool_error(str(exc))
     max_children = _get_max_concurrent_children()
+    if bounded is not None:
+        default_max_iter = bounded.limits["child_max_iterations"]
+        max_children = min(max_children, bounded.limits["max_concurrent_children"])
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
     if not err:
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
@@ -505,6 +541,11 @@ def delegate_task(
         task_images, err = _coerce_task_images(task_list, images)
     if err:
         return tool_error(err)
+    if bounded is not None:
+        try:
+            bounded.admit_children(len(task_list), [str(t.get("goal") or "") + str(t.get("context") or context or "") for t in task_list])
+        except (ValueError, RuntimeError) as exc:
+            return tool_error(str(exc))
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
     if err:
         return tool_error(err)
