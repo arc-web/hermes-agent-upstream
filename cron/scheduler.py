@@ -35,6 +35,8 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Union
 # `hermes update`) otherwise fail with ModuleNotFoundError for hermes_time et al.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from cron.run_limits import bounded_run_for
+
 from cron.worker_bootstrap import WORKER_MARKER
 from hermes_constants import get_hermes_home, hermes_home_key
 from hermes_cli.observability.shared_metrics_gateway import note_cron_execution, note_cron_skipped
@@ -1907,7 +1909,8 @@ def _run_agent_with_watchdog(
     watchdog: default 600s, override HERMES_CRON_TIMEOUT, 0 = unlimited."""
     _cron_timeout = _cron_inactivity_seconds()
     _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
-    _POLL_INTERVAL = 5.0
+    bounded = bounded_run_for(agent)
+    _POLL_INTERVAL = .1 if bounded is not None else 5.0
     # Heartbeat the one-shot run_claim while alive: without it a long run looks like a dead owner
     # and gets re-dispatched / stale-removed out from under the live run.
     # Keep the one-shot run_claim fresh while the run is alive (#62002): the claim TTL is a dead-owner
@@ -1946,6 +1949,9 @@ def _run_agent_with_watchdog(
     _cron_context = contextvars.copy_context()
     _cron_future = _cron_pool.submit(
         _cron_context.run, agent.run_conversation, prompt, task_id=task_id)
+    if bounded is not None:
+        _cron_future.add_done_callback(bounded.finish_parent)
+        bounded.start()
     if worker_state is not None:
         worker_state["future"] = _cron_future
     _inactivity_timeout = False
@@ -1978,13 +1984,17 @@ def _run_agent_with_watchdog(
             # loop / hung ``get_activity_summary`` on this thread can no longer keep the 600s inactivity
             # limit from firing (#94285).
             _watch_thread.start()
-        if _cron_inactivity_limit is None and not _is_oneshot and cancel_event is None:
+        if bounded is None and _cron_inactivity_limit is None and not _is_oneshot and cancel_event is None:
             result = _cron_future.result()
         else:
             result = None
             while True:
+                if bounded is not None:
+                    bounded.check()
                 done, _ = concurrent.futures.wait({_cron_future}, timeout=_POLL_INTERVAL)
                 if done:
+                    if bounded is not None:
+                        bounded.check()
                     _abort_if_fire_claim_lost()
                     result = _cron_future.result()
                     break
@@ -1997,6 +2007,8 @@ def _run_agent_with_watchdog(
         raise
     finally:
         _watch_stop.set()
+        if bounded is not None:
+            bounded.close()
         _cron_pool.shutdown(wait=False, cancel_futures=True)
 
     if _inactivity_timeout:
@@ -2423,7 +2435,14 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
     runtime = setup.runtime
     pr = _cfg.get("provider_routing") or {}
-    return AIAgent(
+    from cron.run_limits import validate_limits, audited_daily_tokens, BoundedCronRun
+    limits = validate_limits(job.get("run_limits"), str(job.get("id") or ""))
+    if limits:
+        setup.max_iterations = min(setup.max_iterations, limits["parent_max_iterations"])
+        baseline = audited_daily_tokens(_usage_audit_path(), limits["audit_job_ids"])
+        if baseline >= limits["daily_tokens"]:
+            raise RuntimeError("Cron audited UTC-day token limit reached before agent creation")
+    agent = AIAgent(
         model=setup.model,
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
@@ -2456,23 +2475,37 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         session_db=session_db,
     )
 
+    if limits:
+        try:
+            agent._bounded_cron_run = BoundedCronRun(limits, agent, baseline)
+        except Exception:
+            agent.close()
+            raise
+    return agent
+
 
 class _FireAudit:
     """One usage_audit.jsonl line per fire (created once the agent exists; fire id + start clock)."""
 
-    def __init__(self, job: dict, job_id: str, model: str):
+    def __init__(self, job: dict, job_id: str, model: str, agent=None):
+        self.agent = agent
         self.job, self.job_id, self.model = job, job_id, model
         self.fire_id = uuid.uuid4().hex
         self.t_start = time.monotonic()
 
     def write(self, result: dict, error: Optional[str]) -> None:
+        bounded = bounded_run_for(self.agent)
+        if bounded is not None and error:
+            bounded.mark_incomplete(self.agent, "Cron fire failed or interrupted")
+        usage = bounded.receipt() if bounded is not None else {}
         _write_usage_audit({
+            **usage,
             "ts": _utcnow_iso_ms(),
             "job_id": self.job_id,
             "fire_id": self.fire_id,
             "prompt_tokens": result.get("prompt_tokens"),
             "completion_tokens": result.get("completion_tokens"),
-            "total_tokens": result.get("total_tokens"),
+            "total_tokens": usage.get("total_tokens") if bounded is not None else result.get("total_tokens"),
             "response_silent": bool(result.get("response_silent")),
             "deliver_target": self.job.get("deliver"),
             "model": self.model or None,
@@ -2537,7 +2570,7 @@ def run_job(
         agent = _construct_cron_agent(
             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
             session_db=_session_db)
-        _audit = _FireAudit(job, job_id, model)
+        _audit = _FireAudit(job, job_id, model, agent)
 
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,

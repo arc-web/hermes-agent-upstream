@@ -82,8 +82,12 @@ def record_response_usage(
     # Count every completed provider attempt, including providers that omit usage.
     # Token/cost accounting below stays gated on real usage, but the request itself
     # must remain observable.
+    from cron.run_limits import bounded_run_for
+    bounded = bounded_run_for(agent)
     agent.session_api_calls += 1
     if not (hasattr(response, 'usage') and response.usage):
+        if bounded is not None:
+            bounded.mark_incomplete(agent, 'Cron provider response omitted usage')
         if getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage -> cannot adjudicate the prior compaction; consume the
             # pending verdict so later readings aren't charged to it and
@@ -98,6 +102,15 @@ def record_response_usage(
         )
         return ResponseUsageOutcome(compression_attempts=compression_attempts, rearmed=rearmed)
 
+    if bounded is not None:
+        raw = response.usage
+        def count(name):
+            value = raw.get(name) if isinstance(raw, dict) else getattr(raw, name, None)
+            return type(value) is int and value >= 0
+        valid = ((count('prompt_tokens') and count('completion_tokens')) or
+                 (count('input_tokens') and count('output_tokens')))
+        if not valid:
+            bounded.mark_incomplete(agent, 'Cron provider usage malformed')
     canonical_usage = with_served_service_tier(
         normalize_usage(response.usage, provider=agent.provider, api_mode=agent.api_mode), response)
     # Aggregator-only usage kept for pricing: advisor tokens are priced at each advisor's

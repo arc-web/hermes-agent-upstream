@@ -152,12 +152,16 @@ def _record_codex_app_server_usage(agent, turn, messages=None) -> dict[str, Any]
     ``messages`` (the transcript mirror) lets real usage anchor the next preflight: this runtime bypasses
     the main loop's capture, and the mirror is never compacted natively, so without an anchor the rough
     estimate grows monotonically and hermes-mode fires thread compaction on tiny threads (#100381)."""
+    from cron.run_limits import bounded_run_for
+    bounded = bounded_run_for(agent)
     agent.session_api_calls += 1
     usage = getattr(turn, "token_usage_last", None)
     compressor = getattr(agent, "context_compressor", None)
 
     def billing(**extra):
         return dict(model=agent.model, billing_provider=agent.provider, billing_base_url=agent.base_url, api_call_count=1, **extra)
+    if bounded is not None and (not isinstance(usage, dict) or any(type(usage.get(key)) is not int or usage[key] < 0 for key in ('inputTokens', 'outputTokens'))):
+        bounded.mark_incomplete(agent, 'Cron Codex provider usage missing or malformed')
     if not isinstance(usage, dict) or not usage:
         if compressor is not None and getattr(compressor, "awaiting_real_usage_after_compression", False):
             # No usage cannot adjudicate the pending compaction; unlatch preflight deferral.
