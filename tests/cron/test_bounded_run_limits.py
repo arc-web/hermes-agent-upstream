@@ -25,7 +25,7 @@ def test_strict_trusted_limits_and_no_implicit_enablement():
 
 def test_existing_audit_exact_scope_date_and_unknown(tmp_path):
     p=tmp_path/'usage_audit.jsonl';now=datetime.datetime(2026,10,9,tzinfo=datetime.timezone.utc)
-    rows=[{'job_id':'daily','ts':'2026-10-09T01:00:00Z','total_tokens':25},{'job_id':'ads','ts':'2026-10-09T02:00:00Z','total_tokens':30},{'job_id':'other','ts':'2026-10-09T02:00:00Z','total_tokens':None},{'job_id':'daily','ts':'2026-10-08T02:00:00Z','total_tokens':999}]
+    rows=[{'job_id':'daily','ts':'2026-10-09T01:00:00Z','total_tokens':25,'usage_complete':True},{'job_id':'ads','ts':'2026-10-09T02:00:00Z','total_tokens':30,'usage_complete':True},{'job_id':'other','ts':'2026-10-09T02:00:00Z','total_tokens':None},{'job_id':'daily','ts':'2026-10-08T02:00:00Z','total_tokens':999}]
     p.write_text('\n'.join(json.dumps(r) for r in rows));assert audited_daily_tokens(p,['daily','ads'],now)==55
     rows.append({'job_id':'daily','ts':'2026-10-09T03:00:00Z','total_tokens':None});p.write_text('\n'.join(json.dumps(r) for r in rows))
     with pytest.raises(ValueError):audited_daily_tokens(p,['daily','ads'],now)
@@ -117,7 +117,7 @@ def test_scoped_constructor_a_b_a_preserves_unrelated_jobs(tmp_path, monkeypatch
 def test_over_budget_blocks_before_native_agent_creation(tmp_path,monkeypatch):
     from cron import scheduler
     now=datetime.datetime.now(datetime.timezone.utc).isoformat()
-    audit=tmp_path/'audit';audit.write_text(json.dumps({'job_id':'daily','ts':now,'total_tokens':100000})+'\n')
+    audit=tmp_path/'audit';audit.write_text(json.dumps({'job_id':'daily','ts':now,'total_tokens':100000,'usage_complete':True})+'\n')
     monkeypatch.setattr(scheduler,'_usage_audit_path',lambda:audit)
     def forbidden(**kwargs):raise AssertionError('Agent constructed after stop gate')
     setup=scheduler._CronAgentSetup(model='test',runtime={},max_iterations=100)
@@ -190,3 +190,15 @@ def test_contradictory_failed_terminal_is_unknown():
     from concurrent.futures import Future
     s=state();f=Future();f.set_result({'completed':True,'failed':True});s.finish_parent(f)
     assert not s.receipt()['usage_complete'] and s.receipt()['total_tokens'] is None
+
+
+@pytest.mark.parametrize('marker',[None,'true',False,0])
+def test_legacy_missing_or_nontrue_audit_cannot_authorize(tmp_path,marker):
+    row={'job_id':'daily','ts':'2026-10-09T00:01:00Z','total_tokens':10}
+    if marker is not None:row['usage_complete']=marker
+    p=tmp_path/'audit';p.write_text(json.dumps(row))
+    with pytest.raises(ValueError):audited_daily_tokens(p,['daily'],datetime.datetime(2026,10,9,tzinfo=datetime.timezone.utc))
+
+def test_failed_audit_is_unknown_despite_true_marker(tmp_path):
+    p=tmp_path/'audit';p.write_text(json.dumps({'job_id':'daily','ts':'2026-10-09T00:01:00Z','total_tokens':10,'usage_complete':True,'error':'synthetic'}))
+    with pytest.raises(ValueError):audited_daily_tokens(p,['daily'],datetime.datetime(2026,10,9,tzinfo=datetime.timezone.utc))

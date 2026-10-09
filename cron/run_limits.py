@@ -35,7 +35,7 @@ def audited_daily_tokens(path: Path, job_ids, now=None):
             stamp=datetime.datetime.fromisoformat(row['ts'].replace('Z','+00:00'))
             if stamp.tzinfo is None: raise ValueError('Usage audit timestamp lacks timezone')
             if stamp.astimezone(datetime.timezone.utc).date()!=day: continue
-            if row.get('usage_complete') is False: raise ValueError('Usage audit incomplete')
+            if row.get('usage_complete') is not True or row.get('error') not in (None,'') or row.get('failed') or row.get('interrupted'): raise ValueError('Usage audit incomplete')
             tokens=row.get('total_tokens')
             if type(tokens) is not int or tokens<0: raise ValueError('Usage audit UNKNOWN')
             total+=tokens
